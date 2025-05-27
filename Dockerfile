@@ -1,51 +1,43 @@
-# Use the official Golang image to build your application
 FROM golang:1.22-alpine AS builder
 
-# Install git (needed for some Go modules)
-RUN apk add --no-cache git
+# Install build dependencies
+RUN apk add --no-cache git ca-certificates tzdata
 
-# Set the working directory
 WORKDIR /app
 
-# Copy the Go module files
+# Copy go module files
 COPY go.mod go.sum ./
-
-# Download all dependencies
 RUN go mod download
 
-# Copy the source code
+# Copy source and build
 COPY . .
+RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -ldflags="-s -w" -o smtp-server .
 
-# Build the Go application
-RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -ldflags="-s -w" -o main .
-
-# Use a minimal base image for the final stage
+# Production image
 FROM alpine:latest
 
-# Install ca-certificates for HTTPS/TLS communication
-RUN apk --no-cache add ca-certificates tzdata
+# Install runtime dependencies
+RUN apk --no-cache add ca-certificates tzdata netcat-openbsd curl
 
-# Create a non-root user
-RUN adduser -D -s /bin/sh appuser
+# Create non-root user
+RUN adduser -D -s /bin/sh mailuser
 
-# Set the working directory
 WORKDIR /app
 
-# Copy the compiled application from the builder stage
-COPY --from=builder /app/main .
+# Copy binary
+COPY --from=builder /app/smtp-server .
 
-# Change ownership to the non-root user
-RUN chown appuser:appuser /app/main
+# Create directories
+RUN mkdir -p /app/logs /app/certs /tmp/mail
+RUN chown -R mailuser:mailuser /app /tmp/mail
 
-# Switch to the non-root user
-USER appuser
+USER mailuser
 
-# Expose the SMTP ports
-EXPOSE 2525 25 587 465
+# Expose ports
+EXPOSE 25 587 2525
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD nc -z localhost 2525 || exit 1
+    CMD nc -z localhost ${SMTP_PORT:-25} || exit 1
 
-# Command to run the executable
-CMD ["./main"]
+CMD ["./smtp-server"]

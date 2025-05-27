@@ -16,8 +16,10 @@ interface EmailConfig {
 
 async function sendTestEmail() {
   const config: EmailConfig = {
-    host: "localhost", // Change to your server's IP/domain for production
+    // host: "localhost", // Change to your server's IP/domain for production
+    host: "13.127.138.214", // <<< CHANGE THIS
     port: 2525,
+
     secure: false,
     auth: {
       user: "admin@snehaa.store",

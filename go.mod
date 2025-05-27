@@ -1,4 +1,4 @@
-module smplify
+module smtp-server
 
 go 1.22.2
 

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/rand"
 	"crypto/tls"
 	"fmt"
 	"io"
@@ -16,223 +17,350 @@ import (
 	gosmtp "github.com/emersion/go-smtp"
 )
 
-// MyBackend implements smtp.Backend
-type MyBackend struct{}
+// Enhanced Backend with better error handling and logging
+type EnhancedBackend struct{}
 
-// NewSession is called by the server to create a new SMTP session.
-func (bkd *MyBackend) NewSession(c *gosmtp.Conn) (gosmtp.Session, error) {
-	log.Printf("New session from %s", c.Conn().RemoteAddr())
-	return &MySession{}, nil
+func (bkd *EnhancedBackend) NewSession(c *gosmtp.Conn) (gosmtp.Session, error) {
+	remoteAddr := c.Conn().RemoteAddr()
+	log.Printf("New SMTP session from %s", remoteAddr)
+
+	return &EnhancedSession{
+		RemoteAddr: remoteAddr.String(),
+		StartTime:  time.Now(),
+	}, nil
 }
 
-// MySession implements smtp.Session
-type MySession struct {
-	From string
-	To   []string
+type EnhancedSession struct {
+	From          string
+	To            []string
+	RemoteAddr    string
+	StartTime     time.Time
+	Authenticated bool
 }
 
-// Auth is called by the server to authenticate a client.
-func (s *MySession) Auth(username, password string) error {
+func (s *EnhancedSession) Auth(username, password string) error {
 	envUser := os.Getenv("SMTP_USERNAME")
 	envPass := os.Getenv("SMTP_PASSWORD")
 
 	if envUser == "" || envPass == "" {
-		log.Println("Warning: SMTP_USERNAME or SMTP_PASSWORD env vars not set. No authentication configured.")
+		log.Printf("Authentication attempted but credentials not configured for session from %s", s.RemoteAddr)
 		return gosmtp.ErrAuthFailed
 	}
 
 	if username == envUser && password == envPass {
-		log.Printf("Authenticated: %s", username)
+		log.Printf("Authentication successful for user '%s' from %s", username, s.RemoteAddr)
+		s.Authenticated = true
 		return nil
 	}
-	log.Printf("Authentication failed for: %s", username)
+
+	log.Printf("Authentication failed for user '%s' from %s", username, s.RemoteAddr)
 	return gosmtp.ErrAuthFailed
 }
 
-// Mail is called by the server to set the sender.
-func (s *MySession) Mail(from string, opts *gosmtp.MailOptions) error {
+func (s *EnhancedSession) Mail(from string, opts *gosmtp.MailOptions) error {
 	s.From = from
-	log.Printf("Mail FROM: %s", from)
+	log.Printf("MAIL FROM: %s (session: %s)", from, s.RemoteAddr)
+
+	// Basic email validation
+	if !isValidEmail(from) {
+		log.Printf("Invalid sender email format: %s", from)
+		return fmt.Errorf("invalid sender email format")
+	}
+
 	return nil
 }
 
-// Rcpt is called by the server to add a recipient.
-func (s *MySession) Rcpt(to string, opts *gosmtp.RcptOptions) error {
+func (s *EnhancedSession) Rcpt(to string, opts *gosmtp.RcptOptions) error {
+	// Basic email validation
+	if !isValidEmail(to) {
+		log.Printf("Invalid recipient email format: %s", to)
+		return fmt.Errorf("invalid recipient email format")
+	}
+
 	s.To = append(s.To, to)
-	log.Printf("Rcpt TO: %s", to)
+	log.Printf("RCPT TO: %s (session: %s)", to, s.RemoteAddr)
 	return nil
 }
 
-// Data is called by the server to read the email content.
-func (s *MySession) Data(r io.Reader) error {
-	log.Printf("Receiving data from %s to %v", s.From, s.To)
+func (s *EnhancedSession) Data(r io.Reader) error {
+	sessionID := generateSessionID()
+	log.Printf("[%s] Receiving email data from %s to %v", sessionID, s.From, s.To)
 
 	emailBytes, err := io.ReadAll(r)
 	if err != nil {
+		log.Printf("[%s] Failed to read email data: %v", sessionID, err)
 		return fmt.Errorf("failed to read email data: %w", err)
 	}
 
-	log.Printf("Received email (first 200 chars):\n%s\n...",
-		strings.ReplaceAll(string(emailBytes[:min(len(emailBytes), 200)]), "\n", "\\n"))
+	// Add basic headers if missing
+	emailContent := string(emailBytes)
+	emailContent = s.enhanceEmailHeaders(emailContent, sessionID)
+	emailBytes = []byte(emailContent)
+
+	log.Printf("[%s] Processing email (%d bytes) from %s", sessionID, len(emailBytes), s.From)
 
 	// Process each recipient
+	successCount := 0
 	for _, recipient := range s.To {
-		if err := s.relayEmail(recipient, emailBytes); err != nil {
-			log.Printf("Failed to relay email to %s: %v", recipient, err)
-			// In production, you'd queue for retry or send bounce message
+		if err := s.relayEmail(recipient, emailBytes, sessionID); err != nil {
+			log.Printf("[%s] Failed to deliver to %s: %v", sessionID, recipient, err)
+		} else {
+			successCount++
 		}
+	}
+
+	if successCount == 0 {
+		return fmt.Errorf("failed to deliver to any recipients")
+	}
+
+	log.Printf("[%s] Successfully delivered to %d/%d recipients", sessionID, successCount, len(s.To))
+	return nil
+}
+
+func (s *EnhancedSession) enhanceEmailHeaders(content, sessionID string) string {
+	lines := strings.Split(content, "\n")
+
+	// Check for required headers
+	hasMessageID := false
+	hasDate := false
+
+	for _, line := range lines {
+		if strings.HasPrefix(strings.ToLower(line), "message-id:") {
+			hasMessageID = true
+		}
+		if strings.HasPrefix(strings.ToLower(line), "date:") {
+			hasDate = true
+		}
+	}
+
+	// Add missing headers
+	additionalHeaders := []string{}
+
+	if !hasMessageID {
+		messageID := fmt.Sprintf("<%s@%s>", sessionID, os.Getenv("SMTP_DOMAIN"))
+		additionalHeaders = append(additionalHeaders, "Message-ID: "+messageID)
+	}
+
+	if !hasDate {
+		additionalHeaders = append(additionalHeaders, "Date: "+time.Now().Format("Mon, 02 Jan 2006 15:04:05 -0700"))
+	}
+
+	// Add server headers
+	serverDomain := os.Getenv("SMTP_DOMAIN")
+	if serverDomain != "" {
+		received := fmt.Sprintf("Received: from %s by %s; %s",
+			s.RemoteAddr, serverDomain, time.Now().Format("Mon, 02 Jan 2006 15:04:05 -0700"))
+		additionalHeaders = append(additionalHeaders, received)
+	}
+
+	if len(additionalHeaders) > 0 {
+		// Find the end of headers (empty line)
+		headerEnd := -1
+		for i, line := range lines {
+			if strings.TrimSpace(line) == "" {
+				headerEnd = i
+				break
+			}
+		}
+
+		if headerEnd >= 0 {
+			// Insert additional headers before the empty line
+			newLines := append(lines[:headerEnd], additionalHeaders...)
+			newLines = append(newLines, lines[headerEnd:]...)
+			return strings.Join(newLines, "\n")
+		} else {
+			// No empty line found, add headers at the beginning
+			return strings.Join(additionalHeaders, "\n") + "\n\n" + content
+		}
+	}
+
+	return content
+}
+
+func (s *EnhancedSession) relayEmail(recipient string, emailBytes []byte, sessionID string) error {
+	// Extract domain
+	parts := strings.Split(recipient, "@")
+	if len(parts) != 2 {
+		return fmt.Errorf("invalid recipient address: %s", recipient)
+	}
+	domain := parts[1]
+
+	// Check if local domain
+	serverDomain := os.Getenv("SMTP_DOMAIN")
+	if domain == serverDomain {
+		return s.handleLocalDelivery(recipient, emailBytes, sessionID)
+	}
+
+	// Handle external delivery
+	return s.handleExternalDelivery(recipient, domain, emailBytes, sessionID)
+}
+
+func (s *EnhancedSession) handleLocalDelivery(recipient string, emailBytes []byte, sessionID string) error {
+	log.Printf("[%s] Local delivery for %s", sessionID, recipient)
+
+	// In a real implementation, you would:
+	// 1. Store email in local mailbox
+	// 2. Check quotas
+	// 3. Apply filters
+	// 4. Notify user
+
+	// For now, just log and save to file (for testing)
+	filename := fmt.Sprintf("/tmp/mail_%s_%s.eml", sessionID, strings.Replace(recipient, "@", "_at_", -1))
+	if err := os.WriteFile(filename, emailBytes, 0644); err != nil {
+		log.Printf("[%s] Failed to save local mail: %v", sessionID, err)
+	} else {
+		log.Printf("[%s] Local mail saved to %s", sessionID, filename)
 	}
 
 	return nil
 }
 
-// relayEmail handles the actual email relaying to external servers
-func (s *MySession) relayEmail(recipient string, emailBytes []byte) error {
-	// Extract recipient domain
-	_, domain, found := strings.Cut(recipient, "@")
-	if !found {
-		return fmt.Errorf("invalid recipient address: %s", recipient)
-	}
+func (s *EnhancedSession) handleExternalDelivery(recipient, domain string, emailBytes []byte, sessionID string) error {
+	// MX lookup with timeout
+	log.Printf("[%s] Looking up MX records for %s", sessionID, domain)
 
-	// Check if this is a local domain (you can customize this logic)
-	serverDomain := os.Getenv("SMTP_DOMAIN")
-	if domain == serverDomain {
-		log.Printf("Local delivery for %s (not implemented - would store in mailbox)", recipient)
-		return nil // For now, just log local deliveries
-	}
-
-	// Perform MX lookup for external domains
 	mxRecords, err := net.LookupMX(domain)
 	if err != nil {
-		return fmt.Errorf("failed to lookup MX records for %s: %w", domain, err)
+		return fmt.Errorf("MX lookup failed for %s: %w", domain, err)
 	}
 	if len(mxRecords) == 0 {
 		return fmt.Errorf("no MX records found for %s", domain)
 	}
 
-	// Sort MX records by preference (lower preference = higher priority)
+	// Sort by preference
 	sort.Slice(mxRecords, func(i, j int) bool {
 		return mxRecords[i].Pref < mxRecords[j].Pref
 	})
 
-	// Try each MX server until one works
+	// Try each MX server
 	var lastErr error
 	for _, mx := range mxRecords {
 		mxHost := strings.TrimSuffix(mx.Host, ".")
-		smtpAddr := mxHost + ":25"
-
-		log.Printf("Attempting to connect to MX server %s for %s", smtpAddr, recipient)
-
-		// Set a reasonable timeout for external connections
-		conn, err := net.DialTimeout("tcp", smtpAddr, 30*time.Second)
-		if err != nil {
-			lastErr = fmt.Errorf("failed to dial MX server %s: %w", smtpAddr, err)
-			log.Print(lastErr)
+		if err := s.tryMXServer(mxHost, recipient, emailBytes, sessionID); err != nil {
+			lastErr = err
+			log.Printf("[%s] MX server %s failed: %v", sessionID, mxHost, err)
 			continue
 		}
 
-		// Create SMTP client from the connection
-		c, err := smtp.NewClient(conn, mxHost)
-		if err != nil {
-			conn.Close()
-			lastErr = fmt.Errorf("failed to create SMTP client for %s: %w", smtpAddr, err)
-			log.Print(lastErr)
-			continue
-		}
-
-		// Try to start TLS if supported
-		if ok, _ := c.Extension("STARTTLS"); ok {
-			tlsConfig := &tls.Config{
-				ServerName:         mxHost,
-				InsecureSkipVerify: false, // Set to true only for testing
-			}
-			if err := c.StartTLS(tlsConfig); err != nil {
-				log.Printf("Warning: Failed to start TLS with %s: %v", smtpAddr, err)
-				// Continue without TLS - some servers allow this
-			} else {
-				log.Printf("Successfully established TLS connection with %s", smtpAddr)
-			}
-		}
-
-		// Send the email
-		if err = c.Mail(s.From); err != nil {
-			c.Close()
-			lastErr = fmt.Errorf("failed MAIL FROM for %s on %s: %w", s.From, smtpAddr, err)
-			log.Print(lastErr)
-			continue
-		}
-
-		if err = c.Rcpt(recipient); err != nil {
-			c.Close()
-			lastErr = fmt.Errorf("failed RCPT TO for %s on %s: %w", recipient, smtpAddr, err)
-			log.Print(lastErr)
-			continue
-		}
-
-		wc, err := c.Data()
-		if err != nil {
-			c.Close()
-			lastErr = fmt.Errorf("failed to get DATA writer for %s: %w", smtpAddr, err)
-			log.Print(lastErr)
-			continue
-		}
-
-		if _, err = wc.Write(emailBytes); err != nil {
-			wc.Close()
-			c.Close()
-			lastErr = fmt.Errorf("failed to write email data for %s: %w", smtpAddr, err)
-			log.Print(lastErr)
-			continue
-		}
-
-		if err = wc.Close(); err != nil {
-			c.Close()
-			lastErr = fmt.Errorf("failed to close DATA writer for %s: %w", smtpAddr, err)
-			log.Print(lastErr)
-			continue
-		}
-
-		c.Quit()
-		c.Close()
-
-		log.Printf("Successfully relayed email for %s to %s via %s", recipient, domain, smtpAddr)
-		return nil // Success!
+		log.Printf("[%s] Successfully delivered to %s via %s", sessionID, recipient, mxHost)
+		return nil
 	}
 
-	return fmt.Errorf("failed to relay email after trying all MX servers: %w", lastErr)
+	return fmt.Errorf("all MX servers failed, last error: %w", lastErr)
 }
 
-// Reset is called by the server to reset the session.
-func (s *MySession) Reset() {
-	s.From = ""
-	s.To = nil
-	log.Println("Session reset")
-}
+func (s *EnhancedSession) tryMXServer(mxHost, recipient string, emailBytes []byte, sessionID string) error {
+	// Connect with timeout
+	smtpAddr := mxHost + ":25"
+	log.Printf("[%s] Connecting to %s", sessionID, smtpAddr)
 
-// Logout is called by the server to terminate the session.
-func (s *MySession) Logout() error {
-	log.Println("Session logout")
+	conn, err := net.DialTimeout("tcp", smtpAddr, 30*time.Second)
+	if err != nil {
+		return fmt.Errorf("connection failed: %w", err)
+	}
+	defer conn.Close()
+
+	// Set connection timeout
+	conn.SetDeadline(time.Now().Add(5 * time.Minute))
+
+	// Create SMTP client
+	c, err := smtp.NewClient(conn, mxHost)
+	if err != nil {
+		return fmt.Errorf("SMTP client creation failed: %w", err)
+	}
+	defer c.Close()
+
+	// Get server capabilities
+	if err = c.Hello(os.Getenv("SMTP_DOMAIN")); err != nil {
+		return fmt.Errorf("HELO failed: %w", err)
+	}
+
+	// Try STARTTLS if available
+	if ok, _ := c.Extension("STARTTLS"); ok {
+		tlsConfig := &tls.Config{
+			ServerName:         mxHost,
+			InsecureSkipVerify: false,
+		}
+		if err := c.StartTLS(tlsConfig); err != nil {
+			log.Printf("[%s] STARTTLS failed for %s: %v", sessionID, mxHost, err)
+			// Continue without TLS for compatibility
+		} else {
+			log.Printf("[%s] TLS established with %s", sessionID, mxHost)
+		}
+	}
+
+	// Send email
+	if err = c.Mail(s.From); err != nil {
+		return fmt.Errorf("MAIL FROM failed: %w", err)
+	}
+
+	if err = c.Rcpt(recipient); err != nil {
+		return fmt.Errorf("RCPT TO failed: %w", err)
+	}
+
+	wc, err := c.Data()
+	if err != nil {
+		return fmt.Errorf("DATA command failed: %w", err)
+	}
+
+	if _, err = wc.Write(emailBytes); err != nil {
+		wc.Close()
+		return fmt.Errorf("data write failed: %w", err)
+	}
+
+	if err = wc.Close(); err != nil {
+		return fmt.Errorf("data close failed: %w", err)
+	}
+
+	c.Quit()
 	return nil
 }
 
-func min(a, b int) int {
-	if a < b {
-		return a
+func (s *EnhancedSession) Reset() {
+	s.From = ""
+	s.To = nil
+	log.Printf("Session reset for %s", s.RemoteAddr)
+}
+
+func (s *EnhancedSession) Logout() error {
+	duration := time.Since(s.StartTime)
+	log.Printf("Session logout for %s (duration: %v)", s.RemoteAddr, duration)
+	return nil
+}
+
+// Helper functions
+func isValidEmail(email string) bool {
+	// Basic email validation
+	parts := strings.Split(email, "@")
+	return len(parts) == 2 && len(parts[0]) > 0 && len(parts[1]) > 0 && strings.Contains(parts[1], ".")
+}
+
+func generateSessionID() string {
+	b := make([]byte, 8)
+	rand.Read(b)
+	return fmt.Sprintf("%x", b)
+}
+
+func getEnv(key, defaultValue string) string {
+	if value := os.Getenv(key); value != "" {
+		return value
 	}
-	return b
+	return defaultValue
 }
 
 func main() {
-	be := &MyBackend{}
+	log.SetFlags(log.LstdFlags | log.Lshortfile)
+
+	be := &EnhancedBackend{}
 	s := gosmtp.NewServer(be)
 
-	// Configure server using environment variables
+	// Server configuration
 	port := getEnv("SMTP_PORT", "2525")
 	s.Addr = ":" + port
 
 	s.Domain = os.Getenv("SMTP_DOMAIN")
 	if s.Domain == "" {
-		log.Fatal("SMTP_DOMAIN environment variable is required.")
+		log.Fatal("SMTP_DOMAIN environment variable is required")
 	}
 
 	// Configure limits
@@ -241,7 +369,7 @@ func main() {
 			s.MaxMessageBytes = val
 		}
 	} else {
-		s.MaxMessageBytes = 10 * 1024 * 1024 // Default to 10MB
+		s.MaxMessageBytes = 25 * 1024 * 1024 // 25MB default
 	}
 
 	if maxRecipients := getEnv("SMTP_MAX_RECIPIENTS", ""); maxRecipients != "" {
@@ -249,25 +377,12 @@ func main() {
 			s.MaxRecipients = val
 		}
 	} else {
-		s.MaxRecipients = 50
+		s.MaxRecipients = 100
 	}
 
 	// Configure timeouts
-	if readTimeout := getEnv("SMTP_READ_TIMEOUT", ""); readTimeout != "" {
-		if val, err := time.ParseDuration(readTimeout); err == nil {
-			s.ReadTimeout = val
-		}
-	} else {
-		s.ReadTimeout = 30 * time.Second
-	}
-
-	if writeTimeout := getEnv("SMTP_WRITE_TIMEOUT", ""); writeTimeout != "" {
-		if val, err := time.ParseDuration(writeTimeout); err == nil {
-			s.WriteTimeout = val
-		}
-	} else {
-		s.WriteTimeout = 30 * time.Second
-	}
+	s.ReadTimeout = 10 * time.Minute
+	s.WriteTimeout = 10 * time.Minute
 
 	// TLS Configuration
 	certFile := os.Getenv("TLS_CERT_FILE")
@@ -276,35 +391,38 @@ func main() {
 		log.Printf("Loading TLS certificates from %s and %s", certFile, keyFile)
 		cert, err := tls.LoadX509KeyPair(certFile, keyFile)
 		if err != nil {
-			log.Fatalf("Failed to load TLS key pair: %v", err)
+			log.Fatalf("Failed to load TLS certificates: %v", err)
 		}
 		s.TLSConfig = &tls.Config{
 			Certificates: []tls.Certificate{cert},
 		}
 		s.AllowInsecureAuth = false
+		log.Println("TLS enabled")
 	} else {
-		log.Println("Warning: TLS_CERT_FILE and TLS_KEY_FILE environment variables not set. Running without TLS (unsafe for production).")
+		log.Println("Warning: Running without TLS (not recommended for production)")
 		s.AllowInsecureAuth = true
 	}
 
-	log.Printf("Starting SMTP server on %s (Domain: %s)", s.Addr, s.Domain)
-	log.Printf("Max Message Bytes: %d, Max Recipients: %d", s.MaxMessageBytes, s.MaxRecipients)
-	log.Printf("Read Timeout: %s, Write Timeout: %s", s.ReadTimeout, s.WriteTimeout)
+	// Authentication requirement
+	authRequired := getEnv("SMTP_AUTH_REQUIRED", "false")
+	if authRequired == "true" {
+		log.Println("Authentication required for all sessions")
+	}
 
+	log.Printf("Starting SMTP server on %s", s.Addr)
+	log.Printf("Domain: %s", s.Domain)
+	log.Printf("Max Message Size: %d bytes", s.MaxMessageBytes)
+	log.Printf("Max Recipients: %d", s.MaxRecipients)
+	log.Printf("Read/Write Timeout: %v", s.ReadTimeout)
+
+	// Create listener
 	ln, err := net.Listen("tcp", s.Addr)
 	if err != nil {
-		log.Fatalf("Error listening on %s: %v", s.Addr, err)
+		log.Fatalf("Failed to listen on %s: %v", s.Addr, err)
 	}
 
+	log.Printf("SMTP server ready to accept connections")
 	if err := s.Serve(ln); err != nil {
-		log.Fatalf("Error serving SMTP: %v", err)
+		log.Fatalf("Server error: %v", err)
 	}
-}
-
-// getEnv returns environment variable value or default
-func getEnv(key, defaultValue string) string {
-	if value := os.Getenv(key); value != "" {
-		return value
-	}
-	return defaultValue
 }

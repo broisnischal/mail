@@ -7,7 +7,7 @@ services:
       - "587:587"     # Submission port
       - "2525:2525"   # Alternative port
     environment:
-      - SMTP_DOMAIN=snehaa.store
+      - SMTP_DOMAIN=main.snehaa.store
       - SMTP_PORT=25
       - SMTP_USERNAME=admin
       - SMTP_PASSWORD=admin

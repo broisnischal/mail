@@ -7,15 +7,15 @@ services:
       - "587:587"     # Submission port
       - "2525:2525"   # Alternative port
     environment:
-      - SMTP_DOMAIN=mail.yourdomain.com
+      - SMTP_DOMAIN=snehaa.store
       - SMTP_PORT=25
       - SMTP_USERNAME=admin
-      - SMTP_PASSWORD=your-secure-password
+      - SMTP_PASSWORD=admin
       - SMTP_MAX_MESSAGE_BYTES=26214400  # 25MB
       - SMTP_MAX_RECIPIENTS=100
       - SMTP_AUTH_REQUIRED=false
-      - TLS_CERT_FILE=/app/certs/fullchain.pem
-      - TLS_KEY_FILE=/app/certs/privkey.pem
+      # - TLS_CERT_FILE=/app/certs/fullchain.pem
+      # - TLS_KEY_FILE=/app/certs/privkey.pem
     volumes:
       - ./certs:/app/certs:ro
       - ./logs:/app/logs

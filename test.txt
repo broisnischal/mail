@@ -1,0 +1,1 @@
+certbot certonly --standalone -d mail.yourdomain.com

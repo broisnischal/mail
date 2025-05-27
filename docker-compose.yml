@@ -1,0 +1,39 @@
+services:
+  smtp-server:
+    build: .
+    container_name: snehaa-mail-server
+    restart: unless-stopped
+    ports:
+      - "25:2525"    # SMTP
+      - "587:2525"   # Submission
+      - "2525:2525"  # Direct access for testing
+    environment:
+      - SMTP_DOMAIN=snehaa.store
+      - SMTP_USERNAME=admin@snehaa.store
+      - SMTP_PASSWORD=your_secure_password_here
+      - SMTP_PORT=2525
+      - SMTP_MAX_MESSAGE_BYTES=10485760  # 10MB
+      - SMTP_MAX_RECIPIENTS=50
+      - SMTP_READ_TIMEOUT=30s
+      - SMTP_WRITE_TIMEOUT=30s
+      # Uncomment these for TLS
+      # - TLS_CERT_FILE=/certs/cert.pem
+      # - TLS_KEY_FILE=/certs/key.pem
+    volumes:
+      # Uncomment for TLS certificates
+      # - ./certs:/certs:ro
+      - smtp_data:/data
+    networks:
+      - smtp_network
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  smtp_data:
+
+networks:
+  smtp_network:
+    driver: bridge
